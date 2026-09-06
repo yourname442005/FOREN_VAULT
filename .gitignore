@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local database
+*.db
+*.sqlite
+*.sqlite3
+
+# Forensic evidence and generated artifacts
+evidence/
+*.E01
+*.e01
+*.EX01
+*.ex01
+*.dd
+*.raw
+*.img
+*.dmg
+*.001
+
+# Generated reports / exports
+reports/
+exports/
+recovered/
+carved/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
