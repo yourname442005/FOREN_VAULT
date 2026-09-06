@@ -125,7 +125,10 @@ def detect_filesystem(
     )
 
 
-def parse_fls_output(file_listing: str) -> list[dict]:
+def parse_fls_output(
+    file_listing: str,
+    deleted: bool = False,
+) -> list[dict]:
     entries = []
 
     for line in file_listing.splitlines():
@@ -147,8 +150,6 @@ def parse_fls_output(file_listing: str) -> list[dict]:
         entry_type = match.group("type")
         inode = int(match.group("inode"))
         name = match.group("name").strip()
-
-        deleted = line.startswith("*")
 
         entries.append(
             {
@@ -193,6 +194,31 @@ def analyze_filesystem(image_path: Path) -> dict:
     )
 
     entries = parse_fls_output(file_listing)
+
+    deleted_listing = run_command(
+        [
+            "fls",
+            "-f",
+            filesystem["code"],
+            "-o",
+            str(offset),
+            "-r",
+            "-d",
+            str(image_path),
+        ]
+    )
+
+    deleted_entries = parse_fls_output(
+        deleted_listing, deleted=True
+    )
+
+    existing_inodes = {
+        entry["inode"] for entry in entries
+    }
+
+    for entry in deleted_entries:
+        if entry["inode"] not in existing_inodes:
+            entries.append(entry)
 
     volume_match = re.search(
         r"Volume Name:\s*(.+)",

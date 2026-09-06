@@ -14,6 +14,18 @@ H264_START_CODES = (
     b"\x00\x00\x01",
 )
 
+VIDEO_EXTENSIONS = {
+    ".h264",
+    ".264",
+    ".h265",
+    ".265",
+    ".dav",
+    ".mp4",
+    ".avi",
+    ".mkv",
+    ".ts",
+}
+
 
 def calculate_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -157,6 +169,7 @@ def recover_deleted_file(
     offset: int,
     inode: int,
     output_path: Path,
+    original_filename: str = "",
 ) -> dict:
     """
     Recover a deleted filesystem object
@@ -189,16 +202,49 @@ def recover_deleted_file(
         result.stdout
     )
 
-    return {
+    size = len(result.stdout)
+
+    if size == 0:
+        return {
+            "method": "inode_recovery",
+            "inode": inode,
+            "output_path": str(output_path),
+            "size": 0,
+            "sha256": None,
+            "recovered": False,
+            "recovery_status": "EMPTY",
+            "validation": None,
+        }
+
+    sha256 = calculate_sha256(result.stdout)
+
+    recovery_result = {
         "method": "inode_recovery",
         "inode": inode,
         "output_path": str(output_path),
-        "size": len(result.stdout),
-        "sha256": calculate_sha256(
-            result.stdout
-        ),
-        "recovered": len(result.stdout) > 0,
+        "size": size,
+        "sha256": sha256,
+        "recovered": True,
+        "recovery_status": "RECOVERED",
+        "validation": None,
     }
+
+    suffix = Path(original_filename).suffix.lower()
+
+    if suffix in VIDEO_EXTENSIONS:
+        validation = validate_media_file(output_path)
+        recovery_result["validation"] = validation
+
+        if validation.get("valid"):
+            recovery_result["recovery_status"] = (
+                "VALIDATED_CANDIDATE"
+            )
+        else:
+            recovery_result["recovery_status"] = (
+                "RECOVERED"
+            )
+
+    return recovery_result
 
 
 def find_file_signatures(
@@ -693,7 +739,7 @@ def carve_h264_candidates(
     max_candidates: int = 20,
     zero_run_threshold: int = 512,
     minimum_candidate_size: int = 1024,
-) -> list[dict]:
+) -> dict:
     """
     Automatic H.264 carving.
 
@@ -717,7 +763,10 @@ def carve_h264_candidates(
     )
 
     if not matches:
-        return []
+        return {
+            "results": [],
+            "failures": [],
+        }
 
     output_directory.mkdir(
         parents=True,
@@ -725,6 +774,7 @@ def carve_h264_candidates(
     )
 
     results = []
+    failures = []
 
     for match in matches[:max_candidates]:
 
@@ -739,11 +789,32 @@ def carve_h264_candidates(
         )
 
         if not boundary["boundary_found"]:
+            failures.append(
+                {
+                    "image_offset": start_offset,
+                    "reason": "no_boundary_found",
+                    "detail": (
+                        "No sustained zero tail detected "
+                        "within scan window."
+                    ),
+                }
+            )
             continue
 
         candidate_size = boundary["size"]
 
         if candidate_size < minimum_candidate_size:
+            failures.append(
+                {
+                    "image_offset": start_offset,
+                    "reason": "candidate_too_small",
+                    "detail": (
+                        f"Candidate size {candidate_size} "
+                        f"bytes below minimum "
+                        f"{minimum_candidate_size}."
+                    ),
+                }
+            )
             continue
 
         output_path = (
@@ -767,6 +838,17 @@ def carve_h264_candidates(
                 output_path.unlink(
                     missing_ok=True
                 )
+                failures.append(
+                    {
+                        "image_offset": start_offset,
+                        "reason": "validation_failed",
+                        "detail": validation.get(
+                            "error",
+                            "Unknown validation failure",
+                        ),
+                        "candidate_size": candidate_size,
+                    }
+                )
                 continue
 
             result["validation"] = validation
@@ -785,9 +867,20 @@ def carve_h264_candidates(
         except (
             OSError,
             ValueError,
-        ):
+        ) as error:
             output_path.unlink(
                 missing_ok=True
             )
+            failures.append(
+                {
+                    "image_offset": start_offset,
+                    "reason": "carving_error",
+                    "detail": str(error),
+                    "candidate_size": candidate_size,
+                }
+            )
 
-    return results
+    return {
+        "results": results,
+        "failures": failures,
+    }

@@ -2,7 +2,8 @@ import hashlib
 from pathlib import Path
 
 
-EVIDENCE_DIR = Path("../evidence/incoming")
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+EVIDENCE_DIR = PROJECT_ROOT / "evidence" / "incoming"
 
 
 def calculate_sha256(file_path: Path) -> str:

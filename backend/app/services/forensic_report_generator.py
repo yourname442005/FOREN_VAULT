@@ -16,7 +16,8 @@ from reportlab.platypus import (
 )
 
 
-REPORTS_DIR = Path("../evidence/reports")
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+REPORTS_DIR = PROJECT_ROOT / "evidence" / "reports"
 
 
 def _safe(value, default="Not available"):
@@ -478,13 +479,32 @@ def _add_recovery(story, styles, recovery_results):
         [
             "Filename",
             "Method",
-            "Recovered",
+            "Status",
             "Size",
+            "Boundary",
             "SHA-256",
         ]
     ]
 
     for result in recovery_results:
+        recovery_status = result.get(
+            "recovery_status",
+            "UNKNOWN",
+        )
+
+        boundary = result.get("boundary") or {}
+        boundary_confidence = boundary.get(
+            "confidence", "N/A"
+        )
+        boundary_method = boundary.get("method")
+        boundary_label = boundary_confidence
+
+        if boundary_method:
+            boundary_label = (
+                f"{boundary_confidence} "
+                f"({boundary_method})"
+            )
+
         data.append(
             [
                 Paragraph(
@@ -496,11 +516,15 @@ def _add_recovery(story, styles, recovery_results):
                     styles["small"],
                 ),
                 Paragraph(
-                    str(bool(result.get("recovered"))),
+                    _safe(recovery_status),
                     styles["small"],
                 ),
                 Paragraph(
                     _format_bytes(result.get("size")),
+                    styles["small"],
+                ),
+                Paragraph(
+                    _safe(boundary_label),
                     styles["small"],
                 ),
                 Paragraph(
@@ -514,11 +538,12 @@ def _add_recovery(story, styles, recovery_results):
         _table(
             data,
             widths=[
-                40 * mm,
                 35 * mm,
-                25 * mm,
-                25 * mm,
-                55 * mm,
+                28 * mm,
+                28 * mm,
+                20 * mm,
+                30 * mm,
+                49 * mm,
             ],
         )
     )
