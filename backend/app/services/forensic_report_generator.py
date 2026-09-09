@@ -489,6 +489,115 @@ def _add_correlations(story, styles, correlations):
     )
 
 
+def _add_investigative_findings(story, styles, evidence_data):
+    story.append(
+        Paragraph(
+            "INVESTIGATIVE EVIDENCE INTELLIGENCE",
+            styles["heading"],
+        )
+    )
+
+    timeline = evidence_data.get("timeline") or []
+    correlations = evidence_data.get("cross_camera_correlations") or []
+    recovery = evidence_data.get("recovery_results") or []
+
+    if not timeline and not correlations and not recovery:
+        story.append(
+            Paragraph(
+                "No investigative findings available.",
+                styles["body"],
+            )
+        )
+        return
+
+    if timeline:
+        cameras_with_recordings = {}
+        for entry in timeline:
+            cam = entry.get("camera_id")
+            if cam:
+                cameras_with_recordings.setdefault(cam, []).append(entry)
+
+        data = [
+            ["Camera", "Recording Count", "Time Range", "Deleted", "Recovered"]
+        ]
+
+        for cam, recs in sorted(cameras_with_recordings.items()):
+            deleted_count = sum(1 for r in recs if r.get("deleted"))
+            recovered_count = sum(1 for r in recs if r.get("deleted"))
+            times = [r.get("start_time") for r in recs if r.get("start_time")]
+            time_range = f"{min(times)} to {max(times)}" if times else "N/A"
+
+            data.append([
+                Paragraph(_safe(cam), styles["small"]),
+                Paragraph(str(len(recs)), styles["small"]),
+                Paragraph(_safe(time_range), styles["small"]),
+                Paragraph(str(deleted_count), styles["small"]),
+                Paragraph(str(recovered_count), styles["small"]),
+            ])
+
+        story.append(
+            _table(
+                data,
+                widths=[25 * mm, 25 * mm, 60 * mm, 20 * mm, 20 * mm],
+            )
+        )
+
+    if correlations:
+        story.append(
+            Paragraph(
+                "TEMPORAL RECORDING CORRELATIONS",
+                styles["heading"],
+            )
+        )
+
+        story.append(
+            Paragraph(
+                "The following temporal recording correlations were identified. "
+                "These represent overlapping recording intervals across cameras. "
+                "They do not imply that cameras observed the same physical event.",
+                styles["body"],
+            )
+        )
+
+        data = [
+            ["Cameras", "Overlap Start", "Overlap End", "TZ Comparable"]
+        ]
+
+        for corr in correlations:
+            tz_comparable = corr.get("timezone_comparable")
+            tz_str = "Yes" if tz_comparable else "No" if tz_comparable is not None else "Unknown"
+
+            data.append([
+                Paragraph(_safe(", ".join(corr.get("camera_ids", []))), styles["small"]),
+                Paragraph(_safe(corr.get("overlap_start")), styles["small"]),
+                Paragraph(_safe(corr.get("overlap_end")), styles["small"]),
+                Paragraph(tz_str, styles["small"]),
+            ])
+
+        story.append(
+            _table(
+                data,
+                widths=[40 * mm, 40 * mm, 40 * mm, 30 * mm],
+            )
+        )
+
+    if recovery:
+        story.append(
+            Paragraph(
+                "RECOVERED EVIDENCE PROVENANCE",
+                styles["heading"],
+            )
+        )
+
+        story.append(
+            Paragraph(
+                "The following recovered evidence items are traceable to source forensic images. "
+                "Boundary estimates may not represent exact original file boundaries.",
+                styles["body"],
+            )
+        )
+
+
 def _add_recovery(story, styles, recovery_results):
     story.append(
         Paragraph(
@@ -834,6 +943,12 @@ def generate_forensic_report(
             "cross_camera_correlations"
         )
         or [],
+    )
+
+    _add_investigative_findings(
+        story,
+        styles,
+        evidence_data,
     )
 
     _add_recovery(

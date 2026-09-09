@@ -947,3 +947,217 @@ def get_evidence_chain_of_custody(evidence_id: str):
         "evidence_id": evidence_id,
         "chain_of_custody": get_custody_history(evidence_id),
     }
+
+
+@router.get("/{evidence_id}/investigative/recordings")
+def investigative_recordings(
+    evidence_id: str,
+    camera_id: str | None = None,
+    deleted: bool | None = None,
+    recovered: bool | None = None,
+    vendor: str | None = None,
+):
+    from app.services.investigative_service import (
+        InvestigativeIndex,
+    )
+
+    connection = get_connection()
+    row = connection.execute(
+        "SELECT evidence_id, filename, stored_path, vendor FROM evidence WHERE evidence_id = ?",
+        (evidence_id,),
+    ).fetchone()
+    connection.close()
+
+    if not row:
+        return {"error": f"Evidence {evidence_id} not found"}
+
+    stored_path = row["stored_path"]
+
+    from app.services.chain_of_custody import get_custody_history
+    custody = get_custody_history(evidence_id)
+
+    recovery_events = [
+        e for e in custody
+        if e.get("action") in ("DELETED_FILE_RECOVERY", "RAW_H264_CARVING")
+    ]
+
+    index = InvestigativeIndex()
+    index.add_evidence(
+        evidence_id=evidence_id,
+        filename=row["filename"],
+        source_image=stored_path,
+        vendor=row["vendor"],
+    )
+
+    return {
+        "evidence_id": evidence_id,
+        "query_type": "recordings",
+        "recordings": [
+            {
+                "filename": r.get("filename"),
+                "method": r.get("method"),
+                "recovery_status": r.get("recovery_status"),
+                "size": r.get("size"),
+                "sha256": r.get("sha256"),
+            }
+            for r in recovery_events
+        ],
+        "provenance": {
+            "evidence_id": evidence_id,
+            "filename": row["filename"],
+            "source_image": stored_path,
+            "vendor": row["vendor"],
+        },
+    }
+
+
+@router.get("/{evidence_id}/investigative/cameras")
+def investigative_cameras(evidence_id: str):
+    connection = get_connection()
+    row = connection.execute(
+        "SELECT evidence_id, filename, stored_path, vendor FROM evidence WHERE evidence_id = ?",
+        (evidence_id,),
+    ).fetchone()
+    connection.close()
+
+    if not row:
+        return {"error": f"Evidence {evidence_id} not found"}
+
+    return {
+        "evidence_id": evidence_id,
+        "query_type": "cameras",
+        "provenance": {
+            "evidence_id": evidence_id,
+            "filename": row["filename"],
+            "vendor": row["vendor"],
+        },
+    }
+
+
+@router.get("/{evidence_id}/investigative/timeline")
+def investigative_timeline(
+    evidence_id: str,
+    start_time: str | None = None,
+    end_time: str | None = None,
+):
+    connection = get_connection()
+    row = connection.execute(
+        "SELECT evidence_id, filename, stored_path, vendor FROM evidence WHERE evidence_id = ?",
+        (evidence_id,),
+    ).fetchone()
+    connection.close()
+
+    if not row:
+        return {"error": f"Evidence {evidence_id} not found"}
+
+    result = {
+        "evidence_id": evidence_id,
+        "query_type": "timeline",
+        "provenance": {
+            "evidence_id": evidence_id,
+            "filename": row["filename"],
+            "vendor": row["vendor"],
+        },
+    }
+
+    if start_time and end_time:
+        result["query_window"] = {
+            "start": start_time,
+            "end": end_time,
+        }
+
+    return result
+
+
+@router.get("/{evidence_id}/investigative/correlations")
+def investigative_correlations(evidence_id: str):
+    connection = get_connection()
+    row = connection.execute(
+        "SELECT evidence_id, filename, stored_path, vendor FROM evidence WHERE evidence_id = ?",
+        (evidence_id,),
+    ).fetchone()
+    connection.close()
+
+    if not row:
+        return {"error": f"Evidence {evidence_id} not found"}
+
+    return {
+        "evidence_id": evidence_id,
+        "query_type": "correlations",
+        "provenance": {
+            "evidence_id": evidence_id,
+            "filename": row["filename"],
+            "vendor": row["vendor"],
+        },
+    }
+
+
+@router.get("/{evidence_id}/investigative/recovery")
+def investigative_recovery(evidence_id: str):
+    connection = get_connection()
+    row = connection.execute(
+        "SELECT evidence_id, filename, stored_path, vendor FROM evidence WHERE evidence_id = ?",
+        (evidence_id,),
+    ).fetchone()
+    connection.close()
+
+    if not row:
+        return {"error": f"Evidence {evidence_id} not found"}
+
+    custody = get_custody_history(evidence_id)
+
+    recovery_events = [
+        e for e in custody
+        if e.get("action") in ("DELETED_FILE_RECOVERY", "RAW_H264_CARVING")
+    ]
+
+    items = []
+    for event in recovery_events:
+        details = event.get("details") or {}
+        items.append({
+            "recovery_id": f"REC-{details.get('inode', details.get('image_offset', 'unknown'))}",
+            "evidence_id": evidence_id,
+            "method": details.get("method"),
+            "image_offset": details.get("image_offset"),
+            "size": details.get("size"),
+            "sha256": details.get("sha256"),
+            "validation_status": "VALIDATED" if details.get("recovery_status") == "VALIDATED_CANDIDATE" else "RECOVERED",
+            "boundary_confidence": (details.get("boundary") or {}).get("confidence"),
+            "exact_boundary": (details.get("boundary") or {}).get("exact_original_boundary_established", False),
+        })
+
+    return {
+        "evidence_id": evidence_id,
+        "query_type": "recovery",
+        "recovery_items": items,
+        "provenance": {
+            "evidence_id": evidence_id,
+            "filename": row["filename"],
+            "vendor": row["vendor"],
+        },
+    }
+
+
+@router.get("/{evidence_id}/investigative/provenance")
+def investigative_provenance(evidence_id: str):
+    connection = get_connection()
+    row = connection.execute(
+        "SELECT evidence_id, filename, stored_path, sha256, vendor FROM evidence WHERE evidence_id = ?",
+        (evidence_id,),
+    ).fetchone()
+    connection.close()
+
+    if not row:
+        return {"error": f"Evidence {evidence_id} not found"}
+
+    return {
+        "evidence_id": evidence_id,
+        "query_type": "provenance",
+        "provenance": {
+            "evidence_id": evidence_id,
+            "filename": row["filename"],
+            "source_image": row["stored_path"],
+            "sha256": row["sha256"],
+            "vendor": row["vendor"],
+        },
+    }

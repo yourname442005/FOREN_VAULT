@@ -35,6 +35,10 @@ class Recording:
     deleted: bool = False
     start_timestamp: TimestampResult | None = None
     end_timestamp: TimestampResult | None = None
+    evidence_id: str | None = None
+    vendor: str | None = None
+    recovered: bool = False
+    recovery_status: str | None = None
 
 
 @dataclass
