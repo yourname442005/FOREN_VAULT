@@ -598,6 +598,111 @@ def _add_investigative_findings(story, styles, evidence_data):
         )
 
 
+def _add_ai_intelligence(story, styles, evidence_data):
+    ai_results = evidence_data.get("ai_results") or {}
+    if not ai_results:
+        return
+
+    has_observations = False
+    for result in ai_results.values():
+        if isinstance(result, dict) and result.get("observations"):
+            has_observations = True
+            break
+
+    if not has_observations:
+        return
+
+    story.append(
+        Paragraph(
+            "AI-ASSISTED MEDIA INTELLIGENCE",
+            styles["heading"],
+        )
+    )
+
+    story.append(
+        Paragraph(
+            "The following AI observations were generated from media analysis. "
+            "AI observations are NOT forensic facts. They represent model outputs "
+            "that require investigator interpretation. Confidence values reflect "
+            "model output, not forensic certainty.",
+            styles["body"],
+        )
+    )
+
+    for analysis_type, result in ai_results.items():
+        if not isinstance(result, dict):
+            continue
+        observations = result.get("observations") or []
+        if not observations:
+            continue
+
+        type_label = analysis_type.replace("_", " ").title()
+
+        story.append(
+            Paragraph(
+                f"{type_label} OBSERVATIONS ({len(observations)} total)",
+                styles["heading"],
+            )
+        )
+
+        provider = result.get("provider", "unknown")
+        story.append(
+            Paragraph(
+                f"Provider: {_safe(provider)} | "
+                f"Status: {_safe(result.get('status', 'unknown'))}",
+                styles["body"],
+            )
+        )
+
+        data = [
+            [
+                "Camera",
+                "Recording",
+                "Label",
+                "Confidence",
+                "Frame",
+                "Media Time",
+                "Timestamp Mapping",
+            ]
+        ]
+
+        for obs in observations[:50]:
+            time_mapping = obs.get("time_mapping") or {}
+            mapping_status = time_mapping.get("mapping_status", "UNKNOWN")
+
+            data.append([
+                Paragraph(_safe(obs.get("camera_id")), styles["small"]),
+                Paragraph(_safe(obs.get("recording_filename")), styles["small"]),
+                Paragraph(_safe(obs.get("label")), styles["small"]),
+                Paragraph(
+                    f"{obs['confidence']:.2f}" if obs.get("confidence") is not None else "N/A",
+                    styles["small"],
+                ),
+                Paragraph(
+                    str(obs["frame_number"]) if obs.get("frame_number") is not None else "N/A",
+                    styles["small"],
+                ),
+                Paragraph(_safe(obs.get("media_timestamp")), styles["small"]),
+                Paragraph(_safe(mapping_status), styles["small"]),
+            ])
+
+        story.append(
+            _table(
+                data,
+                widths=[20 * mm, 30 * mm, 25 * mm, 20 * mm, 15 * mm, 25 * mm, 35 * mm],
+            )
+        )
+
+        if len(observations) > 50:
+            story.append(
+                Paragraph(
+                    f"Showing 50 of {len(observations)} observations. "
+                    "Full results available via API.",
+                    styles["small"],
+                )
+            )
+
+
 def _add_recovery(story, styles, recovery_results):
     story.append(
         Paragraph(
@@ -946,6 +1051,12 @@ def generate_forensic_report(
     )
 
     _add_investigative_findings(
+        story,
+        styles,
+        evidence_data,
+    )
+
+    _add_ai_intelligence(
         story,
         styles,
         evidence_data,

@@ -1161,3 +1161,111 @@ def investigative_provenance(evidence_id: str):
             "vendor": row["vendor"],
         },
     }
+
+
+@router.get("/{evidence_id}/ai/capabilities")
+def ai_capabilities(evidence_id: str):
+    from app.services.ai_analysis import get_capabilities
+    caps = get_capabilities()
+    return {
+        "evidence_id": evidence_id,
+        "capabilities": caps.to_dict(),
+    }
+
+
+@router.post("/{evidence_id}/ai/analyze")
+async def ai_analyze(
+    evidence_id: str,
+    analysis_types: list[str] | None = None,
+    camera_id: str | None = None,
+    recording_filename: str | None = None,
+    sample_interval_seconds: float = 1.0,
+    max_frames: int | None = None,
+):
+    from pathlib import Path
+    from app.services.ai_analysis import analyze_media
+    from app.services.chain_of_custody import record_custody_event
+
+    connection = get_connection()
+    row = connection.execute(
+        "SELECT evidence_id, filename, stored_path, vendor FROM evidence WHERE evidence_id = ?",
+        (evidence_id,),
+    ).fetchone()
+    connection.close()
+
+    if not row:
+        return {"error": f"Evidence {evidence_id} not found"}
+
+    stored_path = Path(row["stored_path"])
+    if not stored_path.exists():
+        return {"error": f"Evidence file not found at: {stored_path}"}
+
+    record_custody_event(
+        evidence_id=evidence_id,
+        action="AI_ANALYSIS_STARTED",
+        description="AI-assisted media analysis started.",
+        details={
+            "analysis_types": analysis_types,
+            "camera_id": camera_id,
+            "recording_filename": recording_filename,
+        },
+    )
+
+    results = analyze_media(
+        media_path=stored_path,
+        evidence_id=evidence_id,
+        recording_filename=recording_filename,
+        camera_id=camera_id,
+        analysis_types=analysis_types,
+        sample_interval_seconds=sample_interval_seconds,
+        max_frames=max_frames,
+    )
+
+    total_observations = sum(r.observation_count for r in results.values())
+
+    record_custody_event(
+        evidence_id=evidence_id,
+        action="AI_ANALYSIS_COMPLETED",
+        description="AI-assisted media analysis completed.",
+        details={
+            "analysis_types": list(results.keys()),
+            "total_observations": total_observations,
+            "providers": {k: v.provider for k, v in results.items()},
+        },
+    )
+
+    return {
+        "evidence_id": evidence_id,
+        "results": {k: v.to_dict() for k, v in results.items()},
+        "total_observations": total_observations,
+    }
+
+
+@router.get("/{evidence_id}/ai/observations")
+def ai_observations(
+    evidence_id: str,
+    camera_id: str | None = None,
+    recording_filename: str | None = None,
+    analysis_type: str | None = None,
+    label: str | None = None,
+    min_confidence: float | None = None,
+):
+    from app.services.ai_analysis import get_capabilities
+
+    caps = get_capabilities()
+
+    return {
+        "evidence_id": evidence_id,
+        "query_type": "ai_observations",
+        "capabilities": caps.to_dict(),
+        "filters_applied": {
+            "camera_id": camera_id,
+            "recording_filename": recording_filename,
+            "analysis_type": analysis_type,
+            "label": label,
+            "min_confidence": min_confidence,
+        },
+        "observations": [],
+        "note": "Use POST /{evidence_id}/ai/analyze to run analysis first. "
+                "Observations are returned in analysis results.",
+    }
