@@ -1,6 +1,5 @@
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock
 
 from app.models.ai_observation import (
     AIAnalysisResult,
@@ -51,13 +50,15 @@ class TestAICapabilityDiscovery:
         assert caps.motion.available is True
         assert caps.motion.provider == "opencv_motion"
 
-    def test_object_detection_unavailable(self):
+    def test_object_detection_available(self):
         caps = get_capabilities()
-        assert caps.object_detection.available is False
+        assert caps.object_detection.available is True
+        assert caps.object_detection.provider == "nanodet"
 
-    def test_face_detection_unavailable(self):
+    def test_face_detection_available(self):
         caps = get_capabilities()
-        assert caps.face_detection.available is False
+        assert caps.face_detection.available is True
+        assert caps.face_detection.provider == "yunet"
 
     def test_capabilities_to_dict(self):
         caps = get_capabilities()
@@ -66,7 +67,8 @@ class TestAICapabilityDiscovery:
         assert "object_detection" in d
         assert "face_detection" in d
         assert d["motion"]["available"] is True
-        assert d["object_detection"]["available"] is False
+        assert d["object_detection"]["available"] is True
+        assert d["face_detection"]["available"] is True
 
 
 # =============================================================================
@@ -74,28 +76,14 @@ class TestAICapabilityDiscovery:
 # =============================================================================
 
 
-class TestProviderUnavailable:
-    def test_object_detector_unavailable(self):
+class TestProviderAvailability:
+    def test_object_detector_available(self):
         provider = ObjectDetectionProvider()
-        assert provider.is_available is False
-        result = provider.analyze_video(Path("test.mp4"))
-        assert result[0]["status"] == "NOT_AVAILABLE"
+        assert provider.is_available is True
 
-    def test_face_detector_unavailable(self):
+    def test_face_detector_available(self):
         provider = FaceDetectionProvider()
-        assert provider.is_available is False
-        result = provider.analyze_video(Path("test.mp4"))
-        assert result[0]["status"] == "NOT_AVAILABLE"
-
-    def test_object_detector_frame(self):
-        provider = ObjectDetectionProvider()
-        result = provider.analyze_frame(MagicMock())
-        assert result[0]["status"] == "NOT_AVAILABLE"
-
-    def test_face_detector_frame(self):
-        provider = FaceDetectionProvider()
-        result = provider.analyze_frame(MagicMock())
-        assert result[0]["status"] == "NOT_AVAILABLE"
+        assert provider.is_available is True
 
 
 # =============================================================================
@@ -131,8 +119,8 @@ class TestProviderSelection:
     def test_available_providers(self):
         available = get_available_providers()
         assert available["motion"] is True
-        assert available["object_detection"] is False
-        assert available["face_detection"] is False
+        assert available["object_detection"] is True
+        assert available["face_detection"] is True
 
 
 # =============================================================================
@@ -301,10 +289,15 @@ class TestMotionNormalization:
 
 
 class TestObjectNormalization:
-    def test_object_not_available(self):
+    def test_object_provider_works(self):
+        import numpy as np
         provider = ObjectDetectionProvider()
-        result = provider.analyze_video(Path("test.mp4"))
-        assert result[0]["status"] == "NOT_AVAILABLE"
+        assert provider.is_available is True
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        img[:] = (128, 128, 128)
+        result = provider.analyze_frame(img, frame_number=0, media_timestamp=0.0)
+        assert isinstance(result, list)
+        assert len(result) > 0
 
     def test_object_with_mock_data(self):
         raw = {
@@ -328,10 +321,14 @@ class TestObjectNormalization:
 
 
 class TestFaceNormalization:
-    def test_face_not_available(self):
+    def test_face_provider_works(self):
+        import numpy as np
         provider = FaceDetectionProvider()
-        result = provider.analyze_video(Path("test.mp4"))
-        assert result[0]["status"] == "NOT_AVAILABLE"
+        assert provider.is_available is True
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        result = provider.analyze_frame(img, frame_number=0, media_timestamp=0.0)
+        assert isinstance(result, list)
+        assert len(result) > 0
 
     def test_face_with_mock_data(self):
         raw = {
@@ -553,12 +550,13 @@ class TestAIPipelineFailure:
         )
         assert result.status == NOT_AVAILABLE
 
-    def test_unavailable_provider_returns_result(self):
+    def test_object_detection_provider_available(self):
         result = analyze_video_file(
-            video_path=Path("test.mp4"),
+            video_path=Path("nonexistent.mp4"),
             analysis_type="object_detection",
         )
-        assert result.status == NOT_AVAILABLE
+        assert result.status == FAILED
+        assert result.error is not None
 
 
 # =============================================================================

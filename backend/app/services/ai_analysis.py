@@ -33,18 +33,24 @@ def get_capabilities() -> AICapabilitiesResult:
         reason=None if available.get("motion") else "OpenCV not installed",
     )
 
+    obj_provider = get_provider("object_detection")
     obj_cap = AICapability(
         analysis_type=OBJECT_DETECTION,
         available=available.get("object_detection", False),
-        provider="unavailable_object_detector",
-        reason="No object detection model available. Install a compatible provider.",
+        provider=obj_provider.provider_name if obj_provider and obj_provider.is_available else None,
+        model_name=obj_provider.model_name if obj_provider and obj_provider.is_available else None,
+        model_version=obj_provider.model_version if obj_provider and obj_provider.is_available else None,
+        reason=None if available.get("object_detection") else "NanoDet model not installed or not loadable",
     )
 
+    face_provider = get_provider("face_detection")
     face_cap = AICapability(
         analysis_type=FACE_DETECTION,
         available=available.get("face_detection", False),
-        provider="unavailable_face_detector",
-        reason="No face detection model available. Install a compatible provider.",
+        provider=face_provider.provider_name if face_provider and face_provider.is_available else None,
+        model_name=face_provider.model_name if face_provider and face_provider.is_available else None,
+        model_version=face_provider.model_version if face_provider and face_provider.is_available else None,
+        reason=None if available.get("face_detection") else "YuNet model not installed or not loadable",
     )
 
     return AICapabilitiesResult(

@@ -47,3 +47,6 @@ carved/
 
 # Logs
 *.log
+
+# AI model binaries (download from OpenCV Zoo)
+backend/models/*.onnx
