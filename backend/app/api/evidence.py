@@ -492,14 +492,38 @@ async def upload_evidence(file: UploadFile = File(...)):
                         parsed_evidence.recordings
                     )
 
+                    capabilities = parser.get_capabilities()
+
                     parser_result = {
                         "status": "parsed",
                         "parser": parser.__class__.__name__,
                         "vendor": parser.vendor_name,
+                        "capabilities": {
+                            "supported": [
+                                cap.name
+                                for cap in capabilities.capabilities
+                                if cap.supported
+                            ],
+                            "unsupported": [
+                                cap.name
+                                for cap in capabilities.capabilities
+                                if not cap.supported
+                            ],
+                            "details": [
+                                {
+                                    "name": cap.name,
+                                    "supported": cap.supported,
+                                    "detail": cap.detail,
+                                }
+                                for cap in capabilities.capabilities
+                            ],
+                        },
                         "dvr_evidence": {
                             "vendor": parsed_evidence.vendor,
                             "model": parsed_evidence.model,
                             "firmware": parsed_evidence.firmware,
+                            "timezone": parsed_evidence.timezone,
+                            "timezone_source": parsed_evidence.timezone_source,
                             "cameras": [
                                 {
                                     "camera_id": camera.camera_id,
@@ -516,6 +540,26 @@ async def upload_evidence(file: UploadFile = File(...)):
                                     "end_time": recording.end_time,
                                     "format": recording.format,
                                     "deleted": recording.deleted,
+                                    "start_timestamp": {
+                                        "original": recording.start_timestamp.original,
+                                        "iso_naive": recording.start_timestamp.iso_naive,
+                                        "iso_aware": recording.start_timestamp.iso_aware,
+                                        "utc": recording.start_timestamp.utc,
+                                        "timezone": recording.start_timestamp.timezone,
+                                        "timezone_source": recording.start_timestamp.timezone_source,
+                                        "normalization_status": recording.start_timestamp.normalization_status,
+                                        "format_used": recording.start_timestamp.format_used,
+                                    } if recording.start_timestamp else None,
+                                    "end_timestamp": {
+                                        "original": recording.end_timestamp.original,
+                                        "iso_naive": recording.end_timestamp.iso_naive,
+                                        "iso_aware": recording.end_timestamp.iso_aware,
+                                        "utc": recording.end_timestamp.utc,
+                                        "timezone": recording.end_timestamp.timezone,
+                                        "timezone_source": recording.end_timestamp.timezone_source,
+                                        "normalization_status": recording.end_timestamp.normalization_status,
+                                        "format_used": recording.end_timestamp.format_used,
+                                    } if recording.end_timestamp else None,
                                 }
                                 for recording in parsed_evidence.recordings
                             ],

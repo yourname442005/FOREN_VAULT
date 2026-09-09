@@ -7,9 +7,22 @@ from app.models.dvr_evidence import (
     DVREvidence,
     Recording,
 )
+from app.models.vendor import (
+    CAPABILITY_CAMERA_EXTRACTION,
+    CAPABILITY_METADATA_EXTRACTION,
+    CAPABILITY_RECORDING_EXTRACTION,
+    CAPABILITY_TIMEZONE_EXTRACTION,
+    CAPABILITY_TIMESTAMP_EXTRACTION,
+    VendorCapability,
+    VendorProfile,
+)
 from app.parsers.vendor_base import VendorParser
 from app.services.timestamp_parser import (
     parse_recording_filename,
+    parse_timestamp,
+)
+from app.services.timezone_extractor import (
+    extract_timezone_from_filesystem,
 )
 from app.services.vendor_detector import (
     extract_file_content,
@@ -231,6 +244,39 @@ class DahuaParser(VendorParser):
 
         return camera_metadata
 
+    def get_capabilities(self) -> VendorProfile:
+        return VendorProfile(
+            vendor_name=self.vendor_name,
+            capabilities=[
+                VendorCapability(
+                    name=CAPABILITY_METADATA_EXTRACTION,
+                    supported=True,
+                    detail="Extracts from .conf, .json, .xml, .ini, .txt, .log files",
+                ),
+                VendorCapability(
+                    name=CAPABILITY_CAMERA_EXTRACTION,
+                    supported=True,
+                    detail="From camera_config.json, channel_config.json, channels.json and directory names",
+                ),
+                VendorCapability(
+                    name=CAPABILITY_RECORDING_EXTRACTION,
+                    supported=True,
+                    detail="Filename pattern YYYYMMDD_HHMMSS_HHMMSS_CAMx",
+                ),
+                VendorCapability(
+                    name=CAPABILITY_TIMESTAMP_EXTRACTION,
+                    supported=True,
+                    detail="Phase 2 TimestampResult with normalization",
+                ),
+                VendorCapability(
+                    name=CAPABILITY_TIMEZONE_EXTRACTION,
+                    supported=True,
+                    detail="From device config files",
+                ),
+            ],
+            parser_class=self.__class__.__name__,
+        )
+
     def can_parse(
         self,
         image_path: Path,
@@ -287,6 +333,12 @@ class DahuaParser(VendorParser):
                 image_path,
                 filesystem_analysis,
             )
+        )
+
+        timezone_hint = extract_timezone_from_filesystem(
+            filesystem_analysis=filesystem_analysis,
+            get_file_content_fn=self._get_file_content,
+            image_path=image_path,
         )
 
         cameras = []
@@ -359,6 +411,14 @@ class DahuaParser(VendorParser):
                             "deleted",
                             False,
                         ),
+                        start_timestamp=parse_timestamp(
+                            parsed["start_time"],
+                            timezone_hint=timezone_hint,
+                        ),
+                        end_timestamp=parse_timestamp(
+                            parsed["end_time"],
+                            timezone_hint=timezone_hint,
+                        ),
                     )
                 )
 
@@ -390,6 +450,8 @@ class DahuaParser(VendorParser):
             vendor=self.vendor_name,
             model=model,
             firmware=firmware,
+            timezone=timezone_hint,
+            timezone_source="device_config" if timezone_hint else None,
             cameras=cameras,
             recordings=recordings,
             metadata={

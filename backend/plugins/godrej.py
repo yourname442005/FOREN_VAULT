@@ -2,7 +2,7 @@ import json
 import re
 from pathlib import Path
 
-from app.models.dvr_evidence import Camera, DVREvidence, Recording
+from app.models.dvr_evidence import DVREvidence
 from app.models.vendor import (
     CAPABILITY_CAMERA_EXTRACTION,
     CAPABILITY_METADATA_EXTRACTION,
@@ -13,34 +13,23 @@ from app.models.vendor import (
     VendorProfile,
 )
 from app.parsers.vendor_base import VendorParser
-from app.services.timestamp_parser import (
-    parse_recording_filename,
-    parse_timestamp,
-)
-from app.services.timezone_extractor import (
-    extract_timezone_from_filesystem,
-)
 from app.services.vendor_detector import (
     extract_file_content,
 )
 
 
-class TPLinkParser(VendorParser):
+class GodrejParser(VendorParser):
 
-    vendor_name = "TP-Link"
+    vendor_name = "Godrej"
 
     MARKERS = (
-        "tp-link",
-        "tplink",
-        "vigi",
-        "vigi security",
-        "vigi nvr",
-        "nvr1008",
-        "nvr2016",
+        "godrej",
+        "godrej security",
+        "securicam",
     )
 
     CAMERA_PATTERN = re.compile(
-        r"^(cam|camera|ch|channel|ipc)[_-]?\d+$",
+        r"^(cam|camera|ch|channel)[_-]?\d+$",
         re.IGNORECASE,
     )
 
@@ -55,13 +44,13 @@ class TPLinkParser(VendorParser):
     }
 
     RECORDING_EXTENSIONS = {
-        ".dav",
         ".h264",
         ".264",
         ".h265",
         ".265",
         ".mp4",
-        ".ts",
+        ".avi",
+        ".mkv",
     }
 
     def _get_file_content(
@@ -87,27 +76,27 @@ class TPLinkParser(VendorParser):
                 VendorCapability(
                     name=CAPABILITY_METADATA_EXTRACTION,
                     supported=True,
-                    detail="Extracts from .conf, .json, .xml, .ini, .txt, .log files",
+                    detail="Extracts generic key/value and JSON metadata from config files",
                 ),
                 VendorCapability(
                     name=CAPABILITY_CAMERA_EXTRACTION,
-                    supported=True,
-                    detail="From directory names matching CAM/CAMERA/CH/CHANNEL/IPC pattern",
+                    supported=False,
+                    detail="No deterministic Godrej camera structure identified",
                 ),
                 VendorCapability(
                     name=CAPABILITY_RECORDING_EXTRACTION,
-                    supported=True,
-                    detail="Filename pattern YYYYMMDD_HHMMSS_HHMMSS_CAMx",
+                    supported=False,
+                    detail="No deterministic Godrej recording filename pattern identified",
                 ),
                 VendorCapability(
                     name=CAPABILITY_TIMESTAMP_EXTRACTION,
-                    supported=True,
-                    detail="Phase 2 TimestampResult with normalization",
+                    supported=False,
+                    detail="No deterministic Godrej timestamp format identified",
                 ),
                 VendorCapability(
                     name=CAPABILITY_TIMEZONE_EXTRACTION,
-                    supported=True,
-                    detail="From device config files",
+                    supported=False,
+                    detail="No deterministic Godrej timezone structure identified",
                 ),
             ],
             parser_class=self.__class__.__name__,
@@ -179,12 +168,6 @@ class TPLinkParser(VendorParser):
             [],
         )
 
-        timezone_hint = extract_timezone_from_filesystem(
-            filesystem_analysis=filesystem_analysis,
-            get_file_content_fn=self._get_file_content,
-            image_path=image_path,
-        )
-
         for entry in files:
 
             if entry.get("type") != "file":
@@ -195,94 +178,37 @@ class TPLinkParser(VendorParser):
                 "",
             )
 
-            extension = Path(
-                filename
-            ).suffix.lower()
+            suffix = Path(filename).suffix.lower()
 
-            content = None
+            if suffix not in self.TEXT_EXTENSIONS:
+                continue
 
-            if extension in self.TEXT_EXTENSIONS:
-
-                content = self._get_file_content(
-                    image_path,
-                    filesystem_analysis,
-                    entry,
-                )
-
-            if content:
-                if extension == ".json":
-                    try:
-                        data = json.loads(content)
-                        if isinstance(data, dict):
-                            metadata.update(data)
-                    except json.JSONDecodeError:
-                        pass
-                else:
-                    for line in content.splitlines():
-
-                        if "=" in line:
-
-                            key, value = line.split(
-                                "=",
-                                1,
-                            )
-
-                            metadata[
-                                key.strip().lower()
-                            ] = value.strip()
-
-            if extension in self.RECORDING_EXTENSIONS:
-
-                parsed = parse_recording_filename(
-                    filename
-                )
-
-                if parsed:
-
-                    recordings.append(
-                        Recording(
-                            filename=filename,
-                            camera_id=parsed.get(
-                                "camera_id"
-                            ),
-                            start_time=parsed.get(
-                                "start_time"
-                            ),
-                            end_time=parsed.get(
-                                "end_time"
-                            ),
-                            format=parsed.get(
-                                "format"
-                            ),
-                            deleted=entry.get(
-                                "deleted",
-                                False,
-                            ),
-                            start_timestamp=parse_timestamp(
-                                parsed["start_time"],
-                                timezone_hint=timezone_hint,
-                            ),
-                            end_timestamp=parse_timestamp(
-                                parsed["end_time"],
-                                timezone_hint=timezone_hint,
-                            ),
-                        )
-                    )
-
-            camera_match = (
-                self.CAMERA_PATTERN.match(
-                    filename
-                )
+            content = self._get_file_content(
+                image_path,
+                filesystem_analysis,
+                entry,
             )
 
-            if camera_match:
+            if not content:
+                continue
 
-                cameras.append(
-                    Camera(
-                        camera_id=filename,
-                        source="filesystem",
-                    )
-                )
+            if suffix == ".json":
+                try:
+                    data = json.loads(content)
+                    if isinstance(data, dict):
+                        metadata.update(data)
+                except json.JSONDecodeError:
+                    pass
+            else:
+                for line in content.splitlines():
+                    if "=" in line:
+                        key, value = line.split(
+                            "=",
+                            1,
+                        )
+                        metadata[
+                            key.strip().lower()
+                        ] = value.strip()
 
         model = (
             metadata.get("model")
@@ -300,8 +226,6 @@ class TPLinkParser(VendorParser):
             vendor=self.vendor_name,
             model=model,
             firmware=firmware,
-            timezone=timezone_hint,
-            timezone_source="device_config" if timezone_hint else None,
             cameras=cameras,
             recordings=recordings,
             metadata={
@@ -317,5 +241,5 @@ class TPLinkParser(VendorParser):
                 ),
                 "raw_device_metadata": metadata,
             },
-            parser="tp_link",
+            parser="godrej",
         )

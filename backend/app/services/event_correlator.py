@@ -8,6 +8,41 @@ from app.services.recording_timeline import (
 )
 
 
+def _timestamps_are_comparable(
+    first: Recording,
+    second: Recording,
+) -> bool:
+
+    first_has_tz = (
+        first.start_timestamp
+        and first.start_timestamp.iso_aware
+    )
+    second_has_tz = (
+        second.start_timestamp
+        and second.start_timestamp.iso_aware
+    )
+
+    if first_has_tz and second_has_tz:
+        return True
+
+    first_has_meta = first.start_timestamp is not None
+    second_has_meta = second.start_timestamp is not None
+
+    if not first_has_meta and not second_has_meta:
+        return True
+
+    first_is_naive = (
+        first.start_timestamp
+        and first.start_timestamp.normalization_status == "TIMEZONE_UNKNOWN"
+    )
+    second_is_naive = (
+        second.start_timestamp
+        and second.start_timestamp.normalization_status == "TIMEZONE_UNKNOWN"
+    )
+
+    return bool(first_is_naive and second_is_naive)
+
+
 def correlate_timestamp(
     recordings: list[Recording],
     timestamp: datetime,
@@ -87,6 +122,11 @@ def correlate_recordings(
             second.end_time
         )
 
+        if first_start.tzinfo is not None and second_start.tzinfo is None:
+            continue
+        if first_start.tzinfo is None and second_start.tzinfo is not None:
+            continue
+
         overlap_start = max(
             first_start,
             second_start,
@@ -100,6 +140,11 @@ def correlate_recordings(
         if overlap_start > overlap_end:
             continue
 
+        timezone_comparable = _timestamps_are_comparable(
+            first,
+            second,
+        )
+
         correlations.append(
             {
                 "camera_a": first.camera_id,
@@ -112,6 +157,7 @@ def correlate_recordings(
                 "overlap_end": (
                     overlap_end.isoformat()
                 ),
+                "timezone_comparable": timezone_comparable,
             }
         )
 

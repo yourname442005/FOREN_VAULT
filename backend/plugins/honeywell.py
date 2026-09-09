@@ -1,11 +1,27 @@
+import json
 import re
 from pathlib import Path
 
 from app.models.dvr_evidence import Camera, DVREvidence, Recording
+from app.models.vendor import (
+    CAPABILITY_CAMERA_EXTRACTION,
+    CAPABILITY_METADATA_EXTRACTION,
+    CAPABILITY_RECORDING_EXTRACTION,
+    CAPABILITY_TIMEZONE_EXTRACTION,
+    CAPABILITY_TIMESTAMP_EXTRACTION,
+    VendorCapability,
+    VendorProfile,
+)
 from app.parsers.vendor_base import VendorParser
-from app.parsers.hikvision import (
-    extract_file_content,
+from app.services.timestamp_parser import (
     parse_recording_filename,
+    parse_timestamp,
+)
+from app.services.timezone_extractor import (
+    extract_timezone_from_filesystem,
+)
+from app.services.vendor_detector import (
+    extract_file_content,
 )
 
 
@@ -45,6 +61,55 @@ class HoneywellParser(VendorParser):
         ".ts",
     }
 
+    def _get_file_content(
+        self,
+        image_path: Path,
+        filesystem_analysis: dict,
+        entry: dict,
+    ) -> str | None:
+
+        return extract_file_content(
+            image_path,
+            filesystem_analysis["filesystem"]["code"],
+            filesystem_analysis["partition"][
+                "start_sector"
+            ],
+            entry["inode"],
+        )
+
+    def get_capabilities(self) -> VendorProfile:
+        return VendorProfile(
+            vendor_name=self.vendor_name,
+            capabilities=[
+                VendorCapability(
+                    name=CAPABILITY_METADATA_EXTRACTION,
+                    supported=True,
+                    detail="Extracts from .conf, .json, .xml, .ini, .txt, .log files",
+                ),
+                VendorCapability(
+                    name=CAPABILITY_CAMERA_EXTRACTION,
+                    supported=True,
+                    detail="From directory names matching CAM/CAMERA/CH/CHANNEL pattern",
+                ),
+                VendorCapability(
+                    name=CAPABILITY_RECORDING_EXTRACTION,
+                    supported=True,
+                    detail="Filename pattern YYYYMMDD_HHMMSS_HHMMSS_CAMx",
+                ),
+                VendorCapability(
+                    name=CAPABILITY_TIMESTAMP_EXTRACTION,
+                    supported=True,
+                    detail="Phase 2 TimestampResult with normalization",
+                ),
+                VendorCapability(
+                    name=CAPABILITY_TIMEZONE_EXTRACTION,
+                    supported=True,
+                    detail="From device config files",
+                ),
+            ],
+            parser_class=self.__class__.__name__,
+        )
+
     def can_parse(
         self,
         image_path: Path,
@@ -71,7 +136,13 @@ class HoneywellParser(VendorParser):
             if entry.get("type") != "file":
                 continue
 
-            content = extract_file_content(
+            if (
+                Path(entry.get("name", "")).suffix.lower()
+                not in self.TEXT_EXTENSIONS
+            ):
+                continue
+
+            content = self._get_file_content(
                 image_path,
                 filesystem_analysis,
                 entry,
@@ -105,6 +176,12 @@ class HoneywellParser(VendorParser):
             [],
         )
 
+        timezone_hint = extract_timezone_from_filesystem(
+            filesystem_analysis=filesystem_analysis,
+            get_file_content_fn=self._get_file_content,
+            image_path=image_path,
+        )
+
         for entry in files:
 
             if entry.get("type") != "file":
@@ -123,26 +200,33 @@ class HoneywellParser(VendorParser):
 
             if extension in self.TEXT_EXTENSIONS:
 
-                content = extract_file_content(
+                content = self._get_file_content(
                     image_path,
                     filesystem_analysis,
                     entry,
                 )
 
             if content:
+                if extension == ".json":
+                    try:
+                        data = json.loads(content)
+                        if isinstance(data, dict):
+                            metadata.update(data)
+                    except json.JSONDecodeError:
+                        pass
+                else:
+                    for line in content.splitlines():
 
-                for line in content.splitlines():
+                        if "=" in line:
 
-                    if "=" in line:
+                            key, value = line.split(
+                                "=",
+                                1,
+                            )
 
-                        key, value = line.split(
-                            "=",
-                            1,
-                        )
-
-                        metadata[key.strip()] = (
-                            value.strip()
-                        )
+                            metadata[
+                                key.strip().lower()
+                            ] = value.strip()
 
             if extension in self.RECORDING_EXTENSIONS:
 
@@ -164,12 +248,20 @@ class HoneywellParser(VendorParser):
                             end_time=parsed.get(
                                 "end_time"
                             ),
-                            format=extension.lstrip(
-                                "."
+                            format=parsed.get(
+                                "format"
                             ),
                             deleted=entry.get(
                                 "deleted",
                                 False,
+                            ),
+                            start_timestamp=parse_timestamp(
+                                parsed["start_time"],
+                                timezone_hint=timezone_hint,
+                            ),
+                            end_timestamp=parse_timestamp(
+                                parsed["end_time"],
+                                timezone_hint=timezone_hint,
                             ),
                         )
                     )
@@ -189,10 +281,24 @@ class HoneywellParser(VendorParser):
                     )
                 )
 
+        model = (
+            metadata.get("model")
+            or metadata.get("device_model")
+            or metadata.get("devicemodel")
+        )
+
+        firmware = (
+            metadata.get("firmware")
+            or metadata.get("firmware_version")
+            or metadata.get("version")
+        )
+
         return DVREvidence(
             vendor=self.vendor_name,
-            model=metadata.get("model"),
-            firmware=metadata.get("firmware"),
+            model=model,
+            firmware=firmware,
+            timezone=timezone_hint,
+            timezone_source="device_config" if timezone_hint else None,
             cameras=cameras,
             recordings=recordings,
             metadata={

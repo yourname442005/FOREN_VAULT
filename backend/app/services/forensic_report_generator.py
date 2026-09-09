@@ -335,12 +335,22 @@ def _add_timeline(story, styles, timeline):
             "Filename",
             "Start",
             "End",
+            "Timezone",
+            "Status",
             "Format",
             "Deleted",
         ]
     ]
 
     for item in timeline:
+        tz_info = ""
+        status_info = ""
+
+        start_ts = item.get("start_timestamp")
+        if start_ts:
+            tz_info = _safe(start_ts.get("timezone")) or "Unknown"
+            status_info = _safe(start_ts.get("normalization_status")) or ""
+
         data.append(
             [
                 Paragraph(
@@ -360,6 +370,14 @@ def _add_timeline(story, styles, timeline):
                     styles["small"],
                 ),
                 Paragraph(
+                    tz_info,
+                    styles["small"],
+                ),
+                Paragraph(
+                    status_info,
+                    styles["small"],
+                ),
+                Paragraph(
                     _safe(item.get("format")),
                     styles["small"],
                 ),
@@ -374,12 +392,14 @@ def _add_timeline(story, styles, timeline):
         _table(
             data,
             widths=[
-                20 * mm,
-                45 * mm,
-                32 * mm,
-                32 * mm,
-                20 * mm,
+                18 * mm,
+                35 * mm,
+                28 * mm,
+                28 * mm,
+                22 * mm,
+                18 * mm,
                 15 * mm,
+                12 * mm,
             ],
         )
     )
@@ -410,10 +430,16 @@ def _add_correlations(story, styles, correlations):
             "Recording B",
             "Overlap Start",
             "Overlap End",
+            "TZ Comparable",
         ]
     ]
 
     for item in correlations:
+        tz_comparable = item.get("timezone_comparable")
+        tz_comparable_str = (
+            "Yes" if tz_comparable else "No"
+        ) if tz_comparable is not None else "Unknown"
+
         data.append(
             [
                 Paragraph(
@@ -440,6 +466,10 @@ def _add_correlations(story, styles, correlations):
                     _safe(item.get("overlap_end")),
                     styles["small"],
                 ),
+                Paragraph(
+                    tz_comparable_str,
+                    styles["small"],
+                ),
             ]
         )
 
@@ -447,12 +477,13 @@ def _add_correlations(story, styles, correlations):
         _table(
             data,
             widths=[
+                18 * mm,
+                18 * mm,
+                30 * mm,
+                30 * mm,
+                28 * mm,
+                28 * mm,
                 20 * mm,
-                20 * mm,
-                35 * mm,
-                35 * mm,
-                35 * mm,
-                35 * mm,
             ],
         )
     )
@@ -762,6 +793,27 @@ def generate_forensic_report(
             ),
         ],
     )
+
+    capabilities = parser_result.get("capabilities") or {}
+    supported_caps = capabilities.get("supported") or []
+    unsupported_caps = capabilities.get("unsupported") or []
+
+    if supported_caps or unsupported_caps:
+        cap_lines = []
+        if supported_caps:
+            cap_lines.append(
+                ("Supported", ", ".join(supported_caps))
+            )
+        if unsupported_caps:
+            cap_lines.append(
+                ("Not Supported", ", ".join(unsupported_caps))
+            )
+        _add_key_value_section(
+            story,
+            styles,
+            "PARSER CAPABILITIES",
+            cap_lines,
+        )
 
     _add_cameras(
         story,
