@@ -6,6 +6,7 @@ from uuid import uuid4
 from fastapi import APIRouter, File, UploadFile
 
 from app.core.database import get_connection
+from app.models.analysis_pipeline import AnalysisPipeline
 from app.parsers.vendor_registry import create_default_registry
 from app.services.chain_of_custody import (
     get_custody_history,
@@ -47,6 +48,8 @@ async def upload_evidence(file: UploadFile = File(...)):
     original_name = Path(file.filename or "unknown").name
     destination = EVIDENCE_DIR / f"{evidence_id}_{original_name}"
 
+    pipeline = AnalysisPipeline(evidence_id=evidence_id)
+
     with destination.open("wb") as buffer:
         while chunk := await file.read(1024 * 1024):
             buffer.write(chunk)
@@ -54,7 +57,16 @@ async def upload_evidence(file: UploadFile = File(...)):
     sha256 = calculate_sha256(destination)
     file_type = identify_file_type(destination)
     classification = classify_evidence(destination, file_type)
-    vendor_result = detect_vendor(destination, file_type)
+
+    pipeline.mark_completed("evidence_detected", {
+        "filename": original_name,
+        "file_size": destination.stat().st_size,
+        "sha256": sha256,
+    })
+    pipeline.mark_completed("evidence_classified", {
+        "file_type": file_type,
+        "classification": classification,
+    })
 
     record_custody_event(
         evidence_id=evidence_id,
@@ -107,6 +119,11 @@ async def upload_evidence(file: UploadFile = File(...)):
     timeline = []
     cross_camera_correlations = []
     analysis_errors = []
+    carving_attempted = False
+    loaded_plugins = []
+    plugin_errors = []
+    raw_image = None
+    temp_directory = None
 
     if classification == "MEDIA":
         media_metadata = analyze_media(working_copy)
@@ -122,499 +139,48 @@ async def upload_evidence(file: UploadFile = File(...)):
             },
         )
 
-        forensic_image_metadata = analyze_forensic_image(
-            working_copy
-        )
+        try:
+            forensic_image_metadata = analyze_forensic_image(
+                working_copy
+            )
+        except Exception as error:
+            forensic_image_metadata = {"error": str(error)}
+            pipeline.mark_failed("evidence_detected", str(error))
+            analysis_errors.append({
+                "stage": "forensic_image_analysis",
+                "error": str(error),
+            })
 
-        raw_image, temp_directory = export_forensic_image_to_raw(
-            working_copy
-        )
+        if forensic_image_metadata and "error" not in forensic_image_metadata:
+            try:
+                raw_image, temp_directory = export_forensic_image_to_raw(
+                    working_copy
+                )
+            except Exception as error:
+                analysis_errors.append({
+                    "stage": "image_export",
+                    "error": str(error),
+                })
 
         try:
-            # -------------------------------------------------
-            # Filesystem analysis
-            # -------------------------------------------------
-
-            try:
-                filesystem_metadata = analyze_filesystem(raw_image)
-            except (
-                subprocess.CalledProcessError,
-                ValueError,
-                OSError,
-            ) as error:
-                analysis_errors.append({
-                    "stage": "filesystem_analysis",
-                    "error": str(error),
-                })
-
-            # -------------------------------------------------
-            # DVR structure detection
-            # -------------------------------------------------
-
-            if filesystem_metadata is not None:
-                try:
-                    dvr_structure = detect_dvr_structure(
-                        filesystem_metadata["files"]
-                    )
-                except Exception as error:
-                    analysis_errors.append({
-                        "stage": "dvr_structure_detection",
-                        "error": str(error),
-                    })
-
-            if filesystem_metadata is not None:
-                record_custody_event(
+            if raw_image is not None:
+                _process_forensic_image(
                     evidence_id=evidence_id,
-                    action="FILESYSTEM_ANALYZED",
-                    description="Filesystem analysis completed.",
-                    details={
-                        "filesystem": filesystem_metadata["filesystem"],
-                        "partition": filesystem_metadata["partition"],
-                        "file_count": len(filesystem_metadata["files"]),
-                    }
-                    if dvr_structure is not None
-                    else {
-                        "filesystem": filesystem_metadata.get("filesystem"),
-                        "partition": filesystem_metadata.get("partition"),
-                    },
+                    raw_image=raw_image,
+                    pipeline=pipeline,
+                    recovery_results=recovery_results,
+                    carving_failures=carving_failures,
+                    analysis_errors=analysis_errors,
+                    carving_attempted=carving_attempted,
+                    filesystem_metadata=filesystem_metadata,
+                    dvr_structure=dvr_structure,
+                    vendor_analysis=vendor_analysis,
+                    parser_result=parser_result,
+                    timeline=timeline,
+                    cross_camera_correlations=cross_camera_correlations,
+                    loaded_plugins=loaded_plugins,
+                    plugin_errors=plugin_errors,
                 )
-
-            # -------------------------------------------------
-            # Recovery
-            # -------------------------------------------------
-
-            if filesystem_metadata is not None:
-
-                filesystem_code = filesystem_metadata["filesystem"]["code"]
-                filesystem_offset = filesystem_metadata["partition"]["start_sector"]
-
-                recovery_directory = (
-                    EVIDENCE_DIR.parent / "recovered" / evidence_id
-                )
-
-                # ------------------------------------------
-                # Phase 1: Filesystem-level deleted recovery
-                # ------------------------------------------
-
-                inode_recovered_offsets = set()
-
-                for entry in filesystem_metadata["files"]:
-                    if not entry.get("deleted"):
-                        continue
-
-                    if entry.get("type") != "file":
-                        continue
-
-                    inode = entry.get("inode")
-
-                    if inode is None:
-                        continue
-
-                    filename = Path(
-                        entry.get("name", f"inode_{inode}")
-                    ).name
-
-                    output_path = (
-                        recovery_directory / f"{inode}_{filename}"
-                    )
-
-                    try:
-                        recovery_result = recover_deleted_file(
-                            image_path=raw_image,
-                            filesystem_code=filesystem_code,
-                            offset=filesystem_offset,
-                            inode=inode,
-                            output_path=output_path,
-                            original_filename=filename,
-                        )
-
-                        recovery_result["filename"] = filename
-                        recovery_results.append(recovery_result)
-
-                        record_custody_event(
-                            evidence_id=evidence_id,
-                            action="DELETED_FILE_RECOVERY",
-                            description=(
-                                "Deleted file recovery attempt completed."
-                            ),
-                            details={
-                                "inode": recovery_result.get("inode"),
-                                "filename": filename,
-                                "recovered": recovery_result.get("recovered"),
-                                "recovery_status": recovery_result.get(
-                                    "recovery_status"
-                                ),
-                                "sha256": recovery_result.get("sha256"),
-                                "method": recovery_result.get("method"),
-                                "size": recovery_result.get("size"),
-                            },
-                        )
-
-                    except subprocess.CalledProcessError as error:
-                        stderr = (
-                            error.stderr.decode(
-                                "utf-8",
-                                errors="ignore",
-                            )
-                            if error.stderr
-                            else "icat failed"
-                        )
-
-                        recovery_result = {
-                            "method": "inode_recovery",
-                            "inode": inode,
-                            "filename": filename,
-                            "output_path": str(output_path),
-                            "size": 0,
-                            "sha256": None,
-                            "recovered": False,
-                            "recovery_status": "FAILED",
-                            "error": stderr,
-                            "validation": None,
-                        }
-
-                        recovery_results.append(recovery_result)
-
-                        record_custody_event(
-                            evidence_id=evidence_id,
-                            action="DELETED_FILE_RECOVERY",
-                            description=(
-                                "Deleted file recovery attempt failed."
-                            ),
-                            details={
-                                "inode": inode,
-                                "filename": filename,
-                                "recovered": False,
-                                "recovery_status": "FAILED",
-                                "error": stderr,
-                            },
-                        )
-
-                # ------------------------------------------
-                # Phase 2: Raw H.264 carving
-                # ------------------------------------------
-
-                carving_attempted = False
-
-                try:
-                    carving_attempted = True
-
-                    carving_output = carve_h264_candidates(
-                        image_path=raw_image,
-                        output_directory=recovery_directory / "carved",
-                    )
-
-                    carving_results = carving_output["results"]
-                    carving_failures = carving_output["failures"]
-
-                    for failure in carving_failures:
-                        record_custody_event(
-                            evidence_id=evidence_id,
-                            action="RAW_H264_CARVING",
-                            description=(
-                                "Raw H.264 carving candidate rejected."
-                            ),
-                            details={
-                                "image_offset": failure.get("image_offset"),
-                                "reason": failure.get("reason"),
-                                "detail": failure.get("detail"),
-                                "source": "raw_h264_carving",
-                            },
-                        )
-
-                    for carving_result in carving_results:
-                        carving_result["filename"] = Path(
-                            carving_result["output_path"]
-                        ).name
-
-                        carving_result["source"] = "raw_h264_carving"
-                        carving_result["recovery_status"] = (
-                            "VALIDATED_CANDIDATE"
-                        )
-
-                        is_duplicate = False
-
-                        for existing in recovery_results:
-                            if not existing.get("recovered"):
-                                continue
-
-                            existing_sha = existing.get("sha256")
-                            carving_sha = carving_result.get("sha256")
-
-                            if (
-                                existing_sha
-                                and carving_sha
-                                and existing_sha == carving_sha
-                            ):
-                                is_duplicate = True
-                                break
-
-                            existing_path = existing.get("output_path")
-                            if existing_path and Path(existing_path).exists():
-                                existing_offset = None
-                                carving_offset = carving_result.get(
-                                    "image_offset"
-                                )
-
-                                if (
-                                    carving_offset is not None
-                                    and existing.get("method") == "inode_recovery"
-                                ):
-                                    carving_size = carving_result.get("size", 0)
-                                    existing_size = existing.get("size", 0)
-
-                                    if (
-                                        carving_size > 0
-                                        and existing_size > 0
-                                        and carving_size == existing_size
-                                    ):
-                                        is_duplicate = True
-                                        break
-
-                        if is_duplicate:
-                            carving_result["recovery_status"] = (
-                                "DUPLICATE_OF_EXISTING"
-                            )
-                            carving_result["duplicate_note"] = (
-                                "Raw carving produced content identical to "
-                                "an existing inode recovery result."
-                            )
-
-                        recovery_results.append(carving_result)
-
-                        record_custody_event(
-                            evidence_id=evidence_id,
-                            action="RAW_H264_CARVING",
-                            description=(
-                                "Raw H.264 carving candidate recovered and "
-                                "validated from forensic image."
-                            ),
-                            details={
-                                "filename": carving_result.get("filename"),
-                                "image_offset": carving_result.get(
-                                    "image_offset"
-                                ),
-                                "size": carving_result.get("size"),
-                                "sha256": carving_result.get("sha256"),
-                                "recovery_status": carving_result.get(
-                                    "recovery_status"
-                                ),
-                                "boundary": carving_result.get("boundary"),
-                                "source": "raw_h264_carving",
-                            },
-                        )
-
-                except (
-                    FileNotFoundError,
-                    ValueError,
-                    OSError,
-                ) as error:
-                    carving_failures.append({
-                        "reason": "carving_pipeline_error",
-                        "detail": str(error),
-                    })
-
-                    record_custody_event(
-                        evidence_id=evidence_id,
-                        action="RAW_H264_CARVING",
-                        description=(
-                            "Raw H.264 carving was attempted but no "
-                            "validated candidate was recovered."
-                        ),
-                        details={
-                            "attempted": True,
-                            "recovered": False,
-                            "error": str(error),
-                            "source": "raw_h264_carving",
-                        },
-                    )
-
-            # -------------------------------------------------
-            # Vendor detection
-            # -------------------------------------------------
-
-            try:
-                vendor_result = detect_vendor(
-                    raw_image,
-                    "forensic-image/raw",
-                    filesystem_metadata,
-                )
-
-                vendor_analysis = {
-                    "vendor": vendor_result.vendor,
-                    "confidence": vendor_result.confidence,
-                    "detection_method": vendor_result.detection_method,
-                    "evidence": vendor_result.evidence,
-                }
-            except Exception as error:
-                analysis_errors.append({
-                    "stage": "vendor_detection",
-                    "error": str(error),
-                })
-
-            # -------------------------------------------------
-            # Parser discovery and parsing
-            # -------------------------------------------------
-
-            loaded_plugins = []
-            plugin_errors = []
-
-            try:
-                parser_registry = create_default_registry()
-
-                plugins_directory = (
-                    Path(__file__).resolve().parents[2] / "plugins"
-                )
-
-                plugin_discovery = parser_registry.discover_plugins(
-                    plugins_directory
-                )
-
-                loaded_plugins = plugin_discovery["loaded_plugins"]
-                plugin_errors = plugin_discovery["plugin_errors"]
-
-                parser = parser_registry.find_parser(
-                    raw_image,
-                    filesystem_metadata,
-                )
-
-                if parser:
-                    parsed_evidence = parser.parse(
-                        raw_image,
-                        filesystem_metadata,
-                    )
-
-                    timeline = build_timeline(
-                        parsed_evidence.recordings
-                    )
-
-                    cross_camera_correlations = correlate_recordings(
-                        parsed_evidence.recordings
-                    )
-
-                    capabilities = parser.get_capabilities()
-
-                    parser_result = {
-                        "status": "parsed",
-                        "parser": parser.__class__.__name__,
-                        "vendor": parser.vendor_name,
-                        "capabilities": {
-                            "supported": [
-                                cap.name
-                                for cap in capabilities.capabilities
-                                if cap.supported
-                            ],
-                            "unsupported": [
-                                cap.name
-                                for cap in capabilities.capabilities
-                                if not cap.supported
-                            ],
-                            "details": [
-                                {
-                                    "name": cap.name,
-                                    "supported": cap.supported,
-                                    "detail": cap.detail,
-                                }
-                                for cap in capabilities.capabilities
-                            ],
-                        },
-                        "dvr_evidence": {
-                            "vendor": parsed_evidence.vendor,
-                            "model": parsed_evidence.model,
-                            "firmware": parsed_evidence.firmware,
-                            "timezone": parsed_evidence.timezone,
-                            "timezone_source": parsed_evidence.timezone_source,
-                            "cameras": [
-                                {
-                                    "camera_id": camera.camera_id,
-                                    "name": camera.name,
-                                    "source": camera.source,
-                                }
-                                for camera in parsed_evidence.cameras
-                            ],
-                            "recordings": [
-                                {
-                                    "filename": recording.filename,
-                                    "camera_id": recording.camera_id,
-                                    "start_time": recording.start_time,
-                                    "end_time": recording.end_time,
-                                    "format": recording.format,
-                                    "deleted": recording.deleted,
-                                    "start_timestamp": {
-                                        "original": recording.start_timestamp.original,
-                                        "iso_naive": recording.start_timestamp.iso_naive,
-                                        "iso_aware": recording.start_timestamp.iso_aware,
-                                        "utc": recording.start_timestamp.utc,
-                                        "timezone": recording.start_timestamp.timezone,
-                                        "timezone_source": recording.start_timestamp.timezone_source,
-                                        "normalization_status": recording.start_timestamp.normalization_status,
-                                        "format_used": recording.start_timestamp.format_used,
-                                    } if recording.start_timestamp else None,
-                                    "end_timestamp": {
-                                        "original": recording.end_timestamp.original,
-                                        "iso_naive": recording.end_timestamp.iso_naive,
-                                        "iso_aware": recording.end_timestamp.iso_aware,
-                                        "utc": recording.end_timestamp.utc,
-                                        "timezone": recording.end_timestamp.timezone,
-                                        "timezone_source": recording.end_timestamp.timezone_source,
-                                        "normalization_status": recording.end_timestamp.normalization_status,
-                                        "format_used": recording.end_timestamp.format_used,
-                                    } if recording.end_timestamp else None,
-                                }
-                                for recording in parsed_evidence.recordings
-                            ],
-                            "metadata": parsed_evidence.metadata,
-                            "parser": parsed_evidence.parser,
-                        },
-                    }
-
-                else:
-                    parser_result = {
-                        "status": "no_matching_parser",
-                        "parser": None,
-                        "vendor": (
-                            vendor_analysis["vendor"]
-                            if vendor_analysis
-                            else "unknown"
-                        ),
-                    }
-
-            except Exception as error:
-                analysis_errors.append({
-                    "stage": "vendor_parsing",
-                    "error": str(error),
-                })
-
-                if parser_result is None:
-                    parser_result = {
-                        "status": "parsing_error",
-                        "parser": None,
-                        "vendor": (
-                            vendor_analysis["vendor"]
-                            if vendor_analysis
-                            else "unknown"
-                        ),
-                        "error": str(error),
-                    }
-
-            parser_result["loaded_plugins"] = loaded_plugins
-            parser_result["plugin_errors"] = plugin_errors
-
-            raw_carving_summary = {
-                "attempted": carving_attempted if 'carving_attempted' in dir() else False,
-                "candidates_recovered": sum(
-                    1
-                    for r in recovery_results
-                    if r.get("method") == "contiguous_carving"
-                    and r.get("source") == "raw_h264_carving"
-                    and r.get("recovered")
-                ),
-                "candidates_rejected": len(carving_failures),
-                "failures": carving_failures,
-            }
-
-            parser_result["raw_carving"] = raw_carving_summary
-
         finally:
             if temp_directory is not None:
                 temp_directory.cleanup()
@@ -622,6 +188,8 @@ async def upload_evidence(file: UploadFile = File(...)):
     recovery_summary = _build_recovery_summary(
         recovery_results, classification
     )
+
+    pipeline.mark_completed("chain_of_custody_recorded")
 
     record_custody_event(
         evidence_id=evidence_id,
@@ -632,7 +200,7 @@ async def upload_evidence(file: UploadFile = File(...)):
             "vendor": (
                 vendor_analysis["vendor"]
                 if vendor_analysis
-                else vendor_result.vendor
+                else "unknown"
             ),
             "sha256": sha256,
             "recovery_attempted": classification == "FORENSIC_IMAGE",
@@ -671,13 +239,13 @@ async def upload_evidence(file: UploadFile = File(...)):
             file_type,
             vendor_analysis["vendor"]
             if vendor_analysis
-            else vendor_result.vendor,
+            else "unknown",
             vendor_analysis["confidence"]
             if vendor_analysis
-            else vendor_result.confidence,
+            else 0.0,
             vendor_analysis["detection_method"]
             if vendor_analysis
-            else vendor_result.detection_method,
+            else "insufficient_evidence",
             "IMPORTED",
             created_at,
         ),
@@ -688,59 +256,78 @@ async def upload_evidence(file: UploadFile = File(...)):
 
     custody_history = get_custody_history(evidence_id)
 
-    evidence_data = {
-        "evidence_id": evidence_id,
-        "filename": original_name,
-        "stored_as": destination.name,
-        "size": destination.stat().st_size,
-        "sha256": sha256,
-        "file_type": file_type,
-        "classification": classification,
-        "vendor": (
-            vendor_analysis["vendor"]
-            if vendor_analysis
-            else vendor_result.vendor
-        ),
-        "vendor_confidence": (
-            vendor_analysis["confidence"]
-            if vendor_analysis
-            else vendor_result.confidence
-        ),
-        "detection_method": (
-            vendor_analysis["detection_method"]
-            if vendor_analysis
-            else vendor_result.detection_method
-        ),
-        "working_copy": str(working_copy),
-        "integrity_verified": integrity_validation["valid"],
-        "integrity_validation": integrity_validation,
-        "media_metadata": media_metadata,
-        "forensic_image_metadata": forensic_image_metadata,
-        "filesystem_metadata": filesystem_metadata,
-        "dvr_structure": dvr_structure,
-        "vendor_analysis": vendor_analysis,
-        "parser_result": parser_result,
-        "timeline": timeline,
-        "cross_camera_correlations": cross_camera_correlations,
-        "recovery_results": recovery_results,
-        "recovery_summary": recovery_summary,
-        "chain_of_custody": custody_history,
-        "analysis_errors": analysis_errors,
-        "status": "IMPORTED",
-    }
+    report_result = {"status": "NOT_GENERATED"}
 
-    report_result = generate_forensic_report(
-        evidence_data
-    )
+    try:
+        evidence_data = {
+            "evidence_id": evidence_id,
+            "filename": original_name,
+            "stored_as": destination.name,
+            "size": destination.stat().st_size,
+            "sha256": sha256,
+            "file_type": file_type,
+            "classification": classification,
+            "vendor": (
+                vendor_analysis["vendor"]
+                if vendor_analysis
+                else "unknown"
+            ),
+            "vendor_confidence": (
+                vendor_analysis["confidence"]
+                if vendor_analysis
+                else 0.0
+            ),
+            "detection_method": (
+                vendor_analysis["detection_method"]
+                if vendor_analysis
+                else "insufficient_evidence"
+            ),
+            "working_copy": str(working_copy),
+            "integrity_verified": integrity_validation["valid"],
+            "integrity_validation": integrity_validation,
+            "media_metadata": media_metadata,
+            "forensic_image_metadata": forensic_image_metadata,
+            "filesystem_metadata": filesystem_metadata,
+            "dvr_structure": dvr_structure,
+            "vendor_analysis": vendor_analysis,
+            "parser_result": parser_result,
+            "timeline": timeline,
+            "cross_camera_correlations": cross_camera_correlations,
+            "recovery_results": recovery_results,
+            "recovery_summary": recovery_summary,
+            "chain_of_custody": custody_history,
+            "analysis_errors": analysis_errors,
+            "analysis_pipeline": pipeline.to_dict(),
+            "pipeline_summary": pipeline.summary(),
+            "status": "IMPORTED",
+        }
+
+        report_result = generate_forensic_report(evidence_data)
+
+        pipeline.mark_completed("report_generated", {
+            "pdf_path": report_result["pdf_path"],
+            "json_path": report_result["json_path"],
+        })
+
+    except Exception as error:
+        report_result = {
+            "status": "GENERATION_FAILED",
+            "error": str(error),
+        }
+        pipeline.mark_failed("report_generated", str(error))
+        analysis_errors.append({
+            "stage": "report_generation",
+            "error": str(error),
+        })
 
     record_custody_event(
         evidence_id=evidence_id,
         action="REPORT_GENERATED",
         description="Standardized forensic report generated.",
         details={
-            "pdf_path": report_result["pdf_path"],
-            "json_path": report_result["json_path"],
-            "generated_at": report_result["generated_at"],
+            "pdf_path": report_result.get("pdf_path"),
+            "json_path": report_result.get("json_path"),
+            "generated_at": report_result.get("generated_at"),
         },
     )
 
@@ -755,17 +342,17 @@ async def upload_evidence(file: UploadFile = File(...)):
         "vendor": (
             vendor_analysis["vendor"]
             if vendor_analysis
-            else vendor_result.vendor
+            else "unknown"
         ),
         "vendor_confidence": (
             vendor_analysis["confidence"]
             if vendor_analysis
-            else vendor_result.confidence
+            else 0.0
         ),
         "detection_method": (
             vendor_analysis["detection_method"]
             if vendor_analysis
-            else vendor_result.detection_method
+            else "insufficient_evidence"
         ),
         "working_copy": str(working_copy),
         "integrity_verified": integrity_validation["valid"],
@@ -782,8 +369,520 @@ async def upload_evidence(file: UploadFile = File(...)):
         "recovery_summary": recovery_summary,
         "chain_of_custody": get_custody_history(evidence_id),
         "analysis_errors": analysis_errors,
+        "analysis_pipeline": pipeline.to_dict(),
+        "pipeline_summary": pipeline.summary(),
         "report": report_result,
         "status": "IMPORTED",
+    }
+
+
+def _process_forensic_image(
+    evidence_id,
+    raw_image,
+    pipeline,
+    recovery_results,
+    carving_failures,
+    analysis_errors,
+    carving_attempted,
+    filesystem_metadata,
+    dvr_structure,
+    vendor_analysis,
+    parser_result,
+    timeline,
+    cross_camera_correlations,
+    loaded_plugins,
+    plugin_errors,
+):
+    try:
+        filesystem_metadata = analyze_filesystem(raw_image)
+        pipeline.mark_completed("filesystem_analyzed", {
+            "filesystem_type": filesystem_metadata.get("filesystem", {}).get("type"),
+            "partition": filesystem_metadata.get("partition", {}).get("description"),
+            "file_count": len(filesystem_metadata.get("files", [])),
+        })
+    except (
+        subprocess.CalledProcessError,
+        ValueError,
+        OSError,
+    ) as error:
+        pipeline.mark_failed("filesystem_analyzed", str(error))
+        analysis_errors.append({
+            "stage": "filesystem_analysis",
+            "error": str(error),
+        })
+        return
+
+    try:
+        dvr_structure = detect_dvr_structure(
+            filesystem_metadata["files"]
+        )
+        pipeline.mark_completed("dvr_structure_detected", {
+            "classification": dvr_structure.get("classification"),
+            "confidence": dvr_structure.get("confidence"),
+        })
+    except Exception as error:
+        pipeline.mark_failed("dvr_structure_detected", str(error))
+        analysis_errors.append({
+            "stage": "dvr_structure_detection",
+            "error": str(error),
+        })
+
+    record_custody_event(
+        evidence_id=evidence_id,
+        action="FILESYSTEM_ANALYZED",
+        description="Filesystem analysis completed.",
+        details={
+            "filesystem": filesystem_metadata["filesystem"],
+            "partition": filesystem_metadata["partition"],
+            "file_count": len(filesystem_metadata["files"]),
+        },
+    )
+
+    filesystem_code = filesystem_metadata["filesystem"]["code"]
+    filesystem_offset = filesystem_metadata["partition"]["start_sector"]
+
+    recovery_directory = (
+        EVIDENCE_DIR.parent / "recovered" / evidence_id
+    )
+
+    for entry in filesystem_metadata["files"]:
+        if not entry.get("deleted"):
+            continue
+        if entry.get("type") != "file":
+            continue
+        inode = entry.get("inode")
+        if inode is None:
+            continue
+
+        filename = Path(
+            entry.get("name", f"inode_{inode}")
+        ).name
+        output_path = (
+            recovery_directory / f"{inode}_{filename}"
+        )
+
+        try:
+            recovery_result = recover_deleted_file(
+                image_path=raw_image,
+                filesystem_code=filesystem_code,
+                offset=filesystem_offset,
+                inode=inode,
+                output_path=output_path,
+                original_filename=filename,
+            )
+            recovery_result["filename"] = filename
+            recovery_results.append(recovery_result)
+
+            record_custody_event(
+                evidence_id=evidence_id,
+                action="DELETED_FILE_RECOVERY",
+                description="Deleted file recovery attempt completed.",
+                details={
+                    "inode": recovery_result.get("inode"),
+                    "filename": filename,
+                    "recovered": recovery_result.get("recovered"),
+                    "recovery_status": recovery_result.get("recovery_status"),
+                    "sha256": recovery_result.get("sha256"),
+                    "method": recovery_result.get("method"),
+                    "size": recovery_result.get("size"),
+                },
+            )
+
+        except subprocess.CalledProcessError as error:
+            stderr = (
+                error.stderr.decode("utf-8", errors="ignore")
+                if error.stderr
+                else "icat failed"
+            )
+            recovery_result = {
+                "method": "inode_recovery",
+                "inode": inode,
+                "filename": filename,
+                "output_path": str(output_path),
+                "size": 0,
+                "sha256": None,
+                "recovered": False,
+                "recovery_status": "FAILED",
+                "error": stderr,
+                "validation": None,
+            }
+            recovery_results.append(recovery_result)
+
+            record_custody_event(
+                evidence_id=evidence_id,
+                action="DELETED_FILE_RECOVERY",
+                description="Deleted file recovery attempt failed.",
+                details={
+                    "inode": inode,
+                    "filename": filename,
+                    "recovered": False,
+                    "recovery_status": "FAILED",
+                    "error": stderr,
+                },
+            )
+
+    if recovery_results:
+        pipeline.mark_completed("deleted_evidence_recovered", {
+            "total_candidates": len(recovery_results),
+            "recovered": sum(1 for r in recovery_results if r.get("recovered")),
+            "failed": sum(1 for r in recovery_results if r.get("recovery_status") == "FAILED"),
+        })
+
+    try:
+        carving_attempted = True
+
+        carving_output = carve_h264_candidates(
+            image_path=raw_image,
+            output_directory=recovery_directory / "carved",
+        )
+
+        carving_results = carving_output["results"]
+        carving_failures.extend(carving_output["failures"])
+
+        for failure in carving_output["failures"]:
+            record_custody_event(
+                evidence_id=evidence_id,
+                action="RAW_H264_CARVING",
+                description="Raw H.264 carving candidate rejected.",
+                details={
+                    "image_offset": failure.get("image_offset"),
+                    "reason": failure.get("reason"),
+                    "detail": failure.get("detail"),
+                    "source": "raw_h264_carving",
+                },
+            )
+
+        for carving_result in carving_results:
+            carving_result["filename"] = Path(
+                carving_result["output_path"]
+            ).name
+            carving_result["source"] = "raw_h264_carving"
+            carving_result["recovery_status"] = "VALIDATED_CANDIDATE"
+
+            is_duplicate = False
+            for existing in recovery_results:
+                if not existing.get("recovered"):
+                    continue
+                existing_sha = existing.get("sha256")
+                carving_sha = carving_result.get("sha256")
+                if (
+                    existing_sha
+                    and carving_sha
+                    and existing_sha == carving_sha
+                ):
+                    is_duplicate = True
+                    break
+                existing_path = existing.get("output_path")
+                if existing_path and Path(existing_path).exists():
+                    carving_offset = carving_result.get("image_offset")
+                    if (
+                        carving_offset is not None
+                        and existing.get("method") == "inode_recovery"
+                    ):
+                        carving_size = carving_result.get("size", 0)
+                        existing_size = existing.get("size", 0)
+                        if (
+                            carving_size > 0
+                            and existing_size > 0
+                            and carving_size == existing_size
+                        ):
+                            is_duplicate = True
+                            break
+
+            if is_duplicate:
+                carving_result["recovery_status"] = "DUPLICATE_OF_EXISTING"
+                carving_result["duplicate_note"] = (
+                    "Raw carving produced content identical to "
+                    "an existing inode recovery result."
+                )
+
+            recovery_results.append(carving_result)
+
+            record_custody_event(
+                evidence_id=evidence_id,
+                action="RAW_H264_CARVING",
+                description="Raw H.264 carving candidate recovered and validated from forensic image.",
+                details={
+                    "filename": carving_result.get("filename"),
+                    "image_offset": carving_result.get("image_offset"),
+                    "size": carving_result.get("size"),
+                    "sha256": carving_result.get("sha256"),
+                    "recovery_status": carving_result.get("recovery_status"),
+                    "boundary": carving_result.get("boundary"),
+                    "source": "raw_h264_carving",
+                },
+            )
+
+        if carving_results:
+            pipeline.mark_completed("recovery_validated", {
+                "carving_candidates": len(carving_results),
+                "carving_rejected": len(carving_output["failures"]),
+            })
+
+    except (
+        FileNotFoundError,
+        ValueError,
+        OSError,
+    ) as error:
+        carving_failures.append({
+            "reason": "carving_pipeline_error",
+            "detail": str(error),
+        })
+        record_custody_event(
+            evidence_id=evidence_id,
+            action="RAW_H264_CARVING",
+            description="Raw H.264 carving was attempted but no validated candidate was recovered.",
+            details={
+                "attempted": True,
+                "recovered": False,
+                "error": str(error),
+                "source": "raw_h264_carving",
+            },
+        )
+
+    try:
+        vendor_result = detect_vendor(
+            raw_image,
+            "forensic-image/raw",
+            filesystem_metadata,
+        )
+        vendor_analysis = {
+            "vendor": vendor_result.vendor,
+            "confidence": vendor_result.confidence,
+            "detection_method": vendor_result.detection_method,
+            "evidence": vendor_result.evidence,
+        }
+        if vendor_result.vendor != "unknown":
+            pipeline.mark_completed("vendor_detected", {
+                "vendor": vendor_result.vendor,
+                "confidence": vendor_result.confidence,
+            })
+        else:
+            pipeline.mark_not_applicable("vendor_detected", "No known vendor markers detected")
+    except Exception as error:
+        pipeline.mark_failed("vendor_detected", str(error))
+        analysis_errors.append({
+            "stage": "vendor_detection",
+            "error": str(error),
+        })
+
+    try:
+        parser_registry = create_default_registry()
+        plugins_directory = (
+            Path(__file__).resolve().parents[2] / "plugins"
+        )
+        plugin_discovery = parser_registry.discover_plugins(
+            plugins_directory
+        )
+        loaded_plugins.extend(plugin_discovery["loaded_plugins"])
+        plugin_errors.extend(plugin_discovery["plugin_errors"])
+
+        parser = parser_registry.find_parser(
+            raw_image,
+            filesystem_metadata,
+        )
+
+        if parser:
+            pipeline.mark_completed("vendor_parser_selected", {
+                "parser": parser.__class__.__name__,
+                "vendor": parser.vendor_name,
+            })
+
+            try:
+                parsed_evidence = parser.parse(
+                    raw_image,
+                    filesystem_metadata,
+                )
+
+                if parsed_evidence.metadata:
+                    pipeline.mark_completed("metadata_extracted", {
+                        "vendor": parsed_evidence.vendor,
+                        "model": parsed_evidence.model,
+                    })
+                else:
+                    pipeline.mark_partial("metadata_extracted", details={
+                        "vendor": parsed_evidence.vendor,
+                        "note": "No metadata extracted from vendor files",
+                    })
+
+                if parsed_evidence.cameras:
+                    pipeline.mark_completed("cameras_extracted", {
+                        "count": len(parsed_evidence.cameras),
+                    })
+                else:
+                    pipeline.mark_partial("cameras_extracted", details={
+                        "note": "No camera directories or config found",
+                    })
+
+                if parsed_evidence.recordings:
+                    pipeline.mark_completed("recordings_extracted", {
+                        "count": len(parsed_evidence.recordings),
+                    })
+                else:
+                    pipeline.mark_partial("recordings_extracted", details={
+                        "note": "No recognized recording files found",
+                    })
+
+                timeline.extend(
+                    build_timeline(parsed_evidence.recordings)
+                )
+
+                if timeline:
+                    timestamps_with_tz = sum(
+                        1 for entry in timeline
+                        if entry.get("start_timestamp", {}).get("timezone")
+                    )
+                    pipeline.mark_completed("timestamps_normalized", {
+                        "total_recordings": len(timeline),
+                        "with_timezone": timestamps_with_tz,
+                        "without_timezone": len(timeline) - timestamps_with_tz,
+                    })
+
+                cross_camera_correlations.extend(
+                    correlate_recordings(parsed_evidence.recordings)
+                )
+
+                if cross_camera_correlations:
+                    pipeline.mark_completed("cross_camera_correlation", {
+                        "correlations_found": len(cross_camera_correlations),
+                    })
+
+                capabilities = parser.get_capabilities()
+
+                parser_result.update({
+                    "status": "parsed",
+                    "parser": parser.__class__.__name__,
+                    "vendor": parser.vendor_name,
+                    "capabilities": {
+                        "supported": [
+                            cap.name
+                            for cap in capabilities.capabilities
+                            if cap.supported
+                        ],
+                        "unsupported": [
+                            cap.name
+                            for cap in capabilities.capabilities
+                            if not cap.supported
+                        ],
+                        "details": [
+                            {
+                                "name": cap.name,
+                                "supported": cap.supported,
+                                "detail": cap.detail,
+                            }
+                            for cap in capabilities.capabilities
+                        ],
+                    },
+                    "dvr_evidence": {
+                        "vendor": parsed_evidence.vendor,
+                        "model": parsed_evidence.model,
+                        "firmware": parsed_evidence.firmware,
+                        "timezone": parsed_evidence.timezone,
+                        "timezone_source": parsed_evidence.timezone_source,
+                        "cameras": [
+                            {
+                                "camera_id": camera.camera_id,
+                                "name": camera.name,
+                                "source": camera.source,
+                            }
+                            for camera in parsed_evidence.cameras
+                        ],
+                        "recordings": [
+                            {
+                                "filename": recording.filename,
+                                "camera_id": recording.camera_id,
+                                "start_time": recording.start_time,
+                                "end_time": recording.end_time,
+                                "format": recording.format,
+                                "deleted": recording.deleted,
+                                "start_timestamp": {
+                                    "original": recording.start_timestamp.original,
+                                    "iso_naive": recording.start_timestamp.iso_naive,
+                                    "iso_aware": recording.start_timestamp.iso_aware,
+                                    "utc": recording.start_timestamp.utc,
+                                    "timezone": recording.start_timestamp.timezone,
+                                    "timezone_source": recording.start_timestamp.timezone_source,
+                                    "normalization_status": recording.start_timestamp.normalization_status,
+                                    "format_used": recording.start_timestamp.format_used,
+                                } if recording.start_timestamp else None,
+                                "end_timestamp": {
+                                    "original": recording.end_timestamp.original,
+                                    "iso_naive": recording.end_timestamp.iso_naive,
+                                    "iso_aware": recording.end_timestamp.iso_aware,
+                                    "utc": recording.end_timestamp.utc,
+                                    "timezone": recording.end_timestamp.timezone,
+                                    "timezone_source": recording.end_timestamp.timezone_source,
+                                    "normalization_status": recording.end_timestamp.normalization_status,
+                                    "format_used": recording.end_timestamp.format_used,
+                                } if recording.end_timestamp else None,
+                            }
+                            for recording in parsed_evidence.recordings
+                        ],
+                        "metadata": parsed_evidence.metadata,
+                        "parser": parsed_evidence.parser,
+                    },
+                })
+
+            except Exception as error:
+                pipeline.mark_failed("metadata_extracted", str(error))
+                analysis_errors.append({
+                    "stage": "vendor_parsing",
+                    "error": str(error),
+                })
+                parser_result.update({
+                    "status": "parsing_error",
+                    "parser": None,
+                    "vendor": (
+                        vendor_analysis["vendor"]
+                        if vendor_analysis
+                        else "unknown"
+                    ),
+                    "error": str(error),
+                })
+
+        else:
+            pipeline.mark_not_applicable("vendor_parser_selected", "No matching parser found")
+            parser_result.update({
+                "status": "no_matching_parser",
+                "parser": None,
+                "vendor": (
+                    vendor_analysis["vendor"]
+                    if vendor_analysis
+                    else "unknown"
+                ),
+            })
+
+    except Exception as error:
+        analysis_errors.append({
+            "stage": "vendor_parsing",
+            "error": str(error),
+        })
+        if not parser_result:
+            parser_result.update({
+                "status": "parsing_error",
+                "parser": None,
+                "vendor": (
+                    vendor_analysis["vendor"]
+                    if vendor_analysis
+                    else "unknown"
+                ),
+                "error": str(error),
+            })
+
+    parser_result["loaded_plugins"] = loaded_plugins
+    parser_result["plugin_errors"] = plugin_errors
+
+    parser_result["raw_carving"] = {
+        "attempted": carving_attempted,
+        "candidates_recovered": sum(
+            1
+            for r in recovery_results
+            if r.get("method") == "contiguous_carving"
+            and r.get("source") == "raw_h264_carving"
+            and r.get("recovered")
+        ),
+        "candidates_rejected": len(carving_failures),
+        "failures": carving_failures,
     }
 
 

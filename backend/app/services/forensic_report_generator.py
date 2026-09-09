@@ -885,6 +885,166 @@ def generate_forensic_report(
         or [],
     )
 
+    analysis_pipeline = (
+        evidence_data.get("analysis_pipeline")
+        or {}
+    )
+
+    stages = analysis_pipeline.get("stages") or {}
+
+    if stages:
+        story.append(
+            Paragraph(
+                "ANALYSIS PIPELINE STATUS",
+                styles["heading"],
+            )
+        )
+
+        data = [
+            [
+                "Stage",
+                "Status",
+                "Details",
+            ]
+        ]
+
+        for stage_name, stage_info in stages.items():
+            status = stage_info.get("status", "UNKNOWN")
+            error = stage_info.get("error")
+            details = stage_info.get("details", {})
+
+            detail_parts = []
+            if error:
+                detail_parts.append(f"Error: {error}")
+            if details:
+                for key, value in details.items():
+                    detail_parts.append(f"{key}: {value}")
+
+            detail_str = "; ".join(detail_parts) if detail_parts else ""
+
+            display_name = stage_name.replace("_", " ").title()
+
+            data.append(
+                [
+                    Paragraph(
+                        _safe(display_name),
+                        styles["small"],
+                    ),
+                    Paragraph(
+                        _safe(status),
+                        styles["small"],
+                    ),
+                    Paragraph(
+                        _safe(detail_str),
+                        styles["small"],
+                    ),
+                ]
+            )
+
+        story.append(
+            _table(
+                data,
+                widths=[55 * mm, 35 * mm, 90 * mm],
+            )
+        )
+
+    analysis_errors = (
+        evidence_data.get("analysis_errors") or []
+    )
+
+    if analysis_errors:
+        story.append(
+            Paragraph(
+                "WARNINGS AND ERRORS",
+                styles["heading"],
+            )
+        )
+
+        data = [
+            [
+                "Stage",
+                "Error",
+            ]
+        ]
+
+        for error_entry in analysis_errors:
+            data.append(
+                [
+                    Paragraph(
+                        _safe(
+                            error_entry.get("stage", "unknown")
+                        ),
+                        styles["small"],
+                    ),
+                    Paragraph(
+                        _safe(
+                            error_entry.get("error", "unknown")
+                        ),
+                        styles["small"],
+                    ),
+                ]
+            )
+
+        story.append(
+            _table(
+                data,
+                widths=[55 * mm, 125 * mm],
+            )
+        )
+
+    limitations = []
+
+    if not dvr_evidence.get("model"):
+        limitations.append(
+            "Device model could not be determined from available metadata."
+        )
+
+    if not dvr_evidence.get("cameras"):
+        limitations.append(
+            "No camera configuration was identified in the evidence."
+        )
+
+    if not evidence_data.get("timeline"):
+        limitations.append(
+            "No recording timeline could be constructed."
+        )
+
+    if recovery_summary.get("duplicates_suppressed", 0) > 0:
+        limitations.append(
+            f"{recovery_summary['duplicates_suppressed']} duplicate recovery "
+            f"candidate(s) were suppressed."
+        )
+
+    if analysis_errors:
+        limitations.append(
+            f"{len(analysis_errors)} analysis error(s) occurred during processing."
+        )
+
+    limitations.append(
+        "No proprietary filesystem decoding was performed. "
+        "Generic forensic analysis was used."
+    )
+
+    limitations.append(
+        "Deleted file recovery boundaries are estimated and "
+        "may not represent exact original file boundaries."
+    )
+
+    story.append(
+        Paragraph(
+            "LIMITATIONS AND DISCLAIMERS",
+            styles["heading"],
+        )
+    )
+
+    for limitation in limitations:
+        story.append(
+            Paragraph(
+                f"- {_safe(limitation)}",
+                styles["body"],
+            )
+        )
+
     story.append(
         Paragraph(
             "REPORT GENERATION",
